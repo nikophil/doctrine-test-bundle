@@ -6,9 +6,14 @@ namespace DAMA\DoctrineTestBundle\PHPUnit;
 
 use DAMA\DoctrineTestBundle\Doctrine\DBAL\StaticDriver;
 use PHPUnit\Event\Code\Test;
+use PHPUnit\Event\Code\TestCollection;
 use PHPUnit\Event\Code\TestMethod;
 use PHPUnit\Event\Test\AfterTestMethodFinished;
 use PHPUnit\Event\Test\AfterTestMethodFinishedSubscriber;
+use PHPUnit\Event\Test\BeforeFirstTestMethodFinished;
+use PHPUnit\Event\Test\BeforeFirstTestMethodFinishedSubscriber;
+use PHPUnit\Event\Test\Passed as TestPassedEvent;
+use PHPUnit\Event\Test\PassedSubscriber as TestPassedSubscriber;
 use PHPUnit\Event\Test\PreparationStarted as TestStartedEvent;
 use PHPUnit\Event\Test\PreparationStartedSubscriber as TestStartedSubscriber;
 use PHPUnit\Event\TestRunner\Finished as TestRunnerFinishedEvent;
@@ -34,6 +39,27 @@ class PHPUnitExtension implements Extension
      */
     public static bool $transactionStarted = false;
     private static bool $transactionSkipped = false;
+
+    /**
+     * Index of each test of the current class in the order they run, by test id.
+     *
+     * @var array<string, int>
+     */
+    private static array $testIndexes = [];
+
+    /**
+     * Index of the last test depending, directly or not, on each test method of the current class.
+     *
+     * @var array<string, int>
+     */
+    private static array $lastDependentIndexes = [];
+
+    /**
+     * Index of the last test needing each savepoint level created for #[KeepDatabaseChanges], innermost level last.
+     *
+     * @var list<int>
+     */
+    private static array $keptLevels = [];
 
     /**
      * @internal
@@ -118,28 +144,42 @@ class PHPUnitExtension implements Extension
             return false;
         }
 
-        $reflectionClass = new \ReflectionClass($test->className());
-
-        if ($reflectionClass->hasMethod($methodName = $test->methodName())
-            && $reflectionClass->getMethod($methodName)->getAttributes(SkipDatabaseRollback::class)
-        ) {
+        if (self::hasMethodAttribute($test, SkipDatabaseRollback::class)) {
             return true;
         }
 
-        return self::hasClassSkipAttribute($test->className());
+        return self::hasClassAttribute($test->className(), SkipDatabaseRollback::class);
+    }
+
+    /**
+     * @internal
+     *
+     * @param class-string $attributeName
+     */
+    public static function hasMethodAttribute(Test $test, string $attributeName): bool
+    {
+        if (!$test instanceof TestMethod) {
+            return false;
+        }
+
+        $reflectionClass = new \ReflectionClass($test->className());
+
+        return $reflectionClass->hasMethod($methodName = $test->methodName())
+            && $reflectionClass->getMethod($methodName)->getAttributes($attributeName) !== [];
     }
 
     /**
      * @internal
      *
      * @param class-string $className
+     * @param class-string $attributeName
      */
-    public static function hasClassSkipAttribute(string $className): bool
+    public static function hasClassAttribute(string $className, string $attributeName): bool
     {
         $reflectionClass = new \ReflectionClass($className);
 
         do {
-            if ($reflectionClass->getAttributes(SkipDatabaseRollback::class)) {
+            if ($reflectionClass->getAttributes($attributeName)) {
                 return true;
             }
         } while (($reflectionClass = $reflectionClass->getParentClass())
@@ -147,6 +187,68 @@ class PHPUnitExtension implements Extension
         );
 
         return false;
+    }
+
+    /**
+     * @internal
+     */
+    public static function collectDependentTests(TestCollection $tests): void
+    {
+        self::$testIndexes = self::$lastDependentIndexes = self::$keptLevels = [];
+        $dependencies = [];
+
+        foreach ($tests as $index => $test) {
+            if (!$test instanceof TestMethod) {
+                continue;
+            }
+
+            self::$testIndexes[$test->id()] = $index;
+            $dependencies[$test->methodName()] ??= [];
+
+            foreach ($test->metadata()->isDependsOnMethod() as $depends) {
+                if ($depends->className() === $test->className()) {
+                    // a dependency runs before the tests depending on it, so its own dependencies are known already
+                    $dependencies[$test->methodName()] += [$depends->methodName() => true] + ($dependencies[$depends->methodName()] ?? []);
+                }
+            }
+
+            foreach (array_keys($dependencies[$test->methodName()]) as $methodName) {
+                self::$lastDependentIndexes[$methodName] = $index;
+            }
+        }
+    }
+
+    /**
+     * @internal
+     */
+    public static function keepDatabaseChanges(Test $test): void
+    {
+        // without static connections, like in a test using #[SkipDatabaseRollback], the changes are committed
+        if (!StaticDriver::isKeepStaticConnections() || !self::hasMethodAttribute($test, KeepDatabaseChanges::class)) {
+            return;
+        }
+
+        // no test depends on this one
+        if (!isset(self::$lastDependentIndexes[$test->methodName()])) {
+            return;
+        }
+
+        StaticDriver::createSavepoint();
+        self::$keptLevels[] = self::$lastDependentIndexes[$test->methodName()];
+    }
+
+    /**
+     * Removes the savepoint levels created for #[KeepDatabaseChanges] that neither this test nor the following ones need.
+     * A level is only removed once the ones created after it are, as they are nested.
+     *
+     * @internal
+     */
+    public static function rollBackKeptDatabaseChanges(Test $test): void
+    {
+        while (self::$keptLevels !== [] && end(self::$keptLevels) < self::$testIndexes[$test->id()]) {
+            array_pop(self::$keptLevels);
+            StaticDriver::rollBackAndReleaseSavepoint();
+        }
     }
 
     /**
@@ -187,7 +289,21 @@ class PHPUnitExtension implements Extension
                 $testSuite = $event->testSuite();
 
                 if ($testSuite instanceof TestSuiteForTestClass) {
-                    PHPUnitExtension::restartTransaction(PHPUnitExtension::hasClassSkipAttribute($testSuite->className()));
+                    PHPUnitExtension::restartTransaction(PHPUnitExtension::hasClassAttribute($testSuite->className(), SkipDatabaseRollback::class));
+                    PHPUnitExtension::collectDependentTests($testSuite->tests());
+                }
+            }
+        });
+
+        // emitted once setUpBeforeClass() and the other before-class methods ran
+        $facade->registerSubscriber(new class implements BeforeFirstTestMethodFinishedSubscriber {
+            public function notify(BeforeFirstTestMethodFinished $event): void
+            {
+                // without static connections, like in a class using #[SkipDatabaseRollback], the changes are committed
+                if (StaticDriver::isKeepStaticConnections()
+                    && PHPUnitExtension::hasClassAttribute($event->testClassName(), ShareSetUpBeforeClassChanges::class)
+                ) {
+                    StaticDriver::createSavepoint();
                 }
             }
         });
@@ -195,7 +311,16 @@ class PHPUnitExtension implements Extension
         $facade->registerSubscriber(new class implements TestStartedSubscriber {
             public function notify(TestStartedEvent $event): void
             {
+                PHPUnitExtension::rollBackKeptDatabaseChanges($event->test());
                 PHPUnitExtension::restartTransaction(PHPUnitExtension::hasSkipAttribute($event->test()), keepSavepointLevel: true);
+            }
+        });
+
+        // emitted after tearDown(), and only for a test that passed: the changes of any other test are rolled back
+        $facade->registerSubscriber(new class implements TestPassedSubscriber {
+            public function notify(TestPassedEvent $event): void
+            {
+                PHPUnitExtension::keepDatabaseChanges($event->test());
             }
         });
 
